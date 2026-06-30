@@ -415,15 +415,40 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         return f"[PDF extraction error: {exc}]"
 
 
+def create_gemini_client(api_key: str):
+    try:
+        from google.api_core.client_options import ClientOptions
+        from google.ai import generativelanguage_v1beta as gal
+        client = gal.GenerativeServiceClient(client_options=ClientOptions(api_key=api_key))
+        return client, gal
+    except Exception:
+        return None, None
+
+
+def gemini_generate_content(prompt: str, api_key: str, model: str = "models/gemini-2.0-flash") -> str:
+    client, gal = create_gemini_client(api_key)
+    if client is None or gal is None:
+        raise RuntimeError("Gemini client unavailable. Install google.ai.generativelanguage_v1beta.")
+
+    content = gal.types.Content(parts=[gal.types.Part(text=prompt)], role="input")
+    response = client.generate_content(model=model, contents=[content])
+    if not getattr(response, "candidates", None):
+        raise ValueError("Empty Gemini response.")
+    candidate = response.candidates[0]
+    content_obj = getattr(candidate, "content", None)
+    if not content_obj:
+        raise ValueError("Gemini response has no content.")
+    text = getattr(content_obj, "text", None)
+    if text is None:
+        raise ValueError("Gemini response content has no text.")
+    return str(text).strip()
+
+
 # ---------------------------------------------------------------------------
 # Helper — Gemini AI evaluation
 # ---------------------------------------------------------------------------
 
 def evaluate_candidate_with_gemini(candidate_info: dict, resume_text: str, job_description: str, api_key: str) -> dict:
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=api_key)
     candidate_context = "\n".join(f"- {k}: {v}" for k, v in candidate_info.items() if v and str(v).strip())
 
     prompt = f"""You are an expert technical recruiter. Evaluate the following candidate against the provided job description. Be fair, objective, and concise.
@@ -434,25 +459,24 @@ Return your evaluation as valid JSON with EXACTLY these keys:
 Score guide: 80-100: Shortlist, 50-79: Maybe, 1-49: Reject. Return ONLY the JSON object."""
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        raw = response.text.strip()
+        raw = gemini_generate_content(prompt, api_key, model="models/gemini-2.0-flash")
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
-            
+
         result = json.loads(raw)
         required = {"score", "recommendation", "strengths", "weaknesses", "summary"}
-        if not required.issubset(result.keys()): raise ValueError("Missing keys")
-        
+        if not required.issubset(result.keys()):
+            raise ValueError("Missing keys")
+
         result["score"] = max(1, min(100, int(result["score"])))
         rec = str(result.get("recommendation", "")).strip().lower()
-        if "shortlist" in rec or "strong" in rec: result["recommendation"] = "Shortlist"
-        elif "maybe" in rec or "partial" in rec or "consider" in rec: result["recommendation"] = "Maybe"
-        else: result["recommendation"] = "Reject"
+        if "shortlist" in rec or "strong" in rec:
+            result["recommendation"] = "Shortlist"
+        elif "maybe" in rec or "partial" in rec or "consider" in rec:
+            result["recommendation"] = "Maybe"
+        else:
+            result["recommendation"] = "Reject"
         return result
     except json.JSONDecodeError:
         return {"score": 0, "recommendation": "Reject", "strengths": ["None"], "weaknesses": ["Parsing Error"], "summary": "Failed to parse AI response."}
@@ -469,14 +493,9 @@ Score guide: 80-100: Shortlist, 50-79: Maybe, 1-49: Reject. Return ONLY the JSON
 # ---------------------------------------------------------------------------
 
 def generate_ai_explanation_with_gemini(candidate_info: dict, resume_text: str, job_description: str, evaluation: dict, api_key: str) -> Optional[dict]:
-    try:
-        from google import genai
-        from google.genai import types
+    candidate_context = "\n".join(f"- {k}: {v}" for k, v in candidate_info.items() if v and str(v).strip())
 
-        client = genai.Client(api_key=api_key)
-        candidate_context = "\n".join(f"- {k}: {v}" for k, v in candidate_info.items() if v and str(v).strip())
-
-        prompt = f"""You are an explainable AI assistant for recruiter screening.
+    prompt = f"""You are an explainable AI assistant for recruiter screening.
 Generate an explanation only for the already completed evaluation. Do not change the score, recommendation, summary, strengths, or weaknesses.
 
 === JOB DESCRIPTION ===
@@ -494,12 +513,8 @@ Generate an explanation only for the already completed evaluation. Do not change
 Return ONLY valid JSON with EXACTLY this structure:
 {{"skills": <integer 0-100>, "projects": <integer 0-100>, "education": <integer 0-100>, "experience": <integer 0-100>, "overall_reasoning": "<brief explanation>", "confidence": "<High | Medium | Low>"}}"""
 
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        raw = response.text.strip()
+    try:
+        raw = gemini_generate_content(prompt, api_key, model="models/gemini-2.0-flash")
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
@@ -687,10 +702,6 @@ def summarize_github_languages(repositories: list[dict]) -> dict:
 
 def generate_github_ai_analysis(profile: dict, repositories: list[dict], api_key: str) -> Optional[dict]:
     try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
         prompt = f"""You are a senior technical recruiter evaluating only a candidate's GitHub profile.
 Do not consider resumes, candidate ranking, or previous AI evaluation scores.
 
@@ -703,12 +714,7 @@ Do not consider resumes, candidate ranking, or previous AI evaluation scores.
 Return ONLY valid JSON with exactly this structure:
 {{"github_score": 87, "technical_strengths": ["...", "...", "..."], "activity_level": "High", "language_summary": "...", "open_source_maturity": "...", "summary": "...", "confidence": "High"}}"""
 
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        raw = response.text.strip()
+        raw = gemini_generate_content(prompt, api_key, model="models/gemini-2.0-flash")
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
@@ -1264,18 +1270,13 @@ def _build_candidates_json() -> str:
 def _cached_hiring_summary(_candidates_json: str, _jd: str, _cache_key: int) -> dict:
     if not st.session_state.current_api_key: return {"error": "No API key"}
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=st.session_state.current_api_key)
         prompt = f"""You are an expert technical recruiter. Analyze this candidate pool for the job below.
 Return JSON: overall_quality (Excellent/Good/Average/Below Average/Poor), hiring_confidence (0-100),
 summary (2-3 sentences), strength, weakness, recommended_action.
 Job: {(_jd or "")[:2000]}
 Candidates: {_candidates_json[:15000]}"""
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-lite", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"))
-        r = json.loads(resp.text)
+        raw = gemini_generate_content(prompt, st.session_state.current_api_key, model="models/gemini-2.0-flash-lite")
+        r = json.loads(raw)
         return {k: r.get(k, "N/A") for k in
                 ["overall_quality", "hiring_confidence", "summary", "strength", "weakness", "recommended_action"]}
     except Exception as e:
@@ -1285,15 +1286,10 @@ Candidates: {_candidates_json[:15000]}"""
 def _cached_risks(_candidates_json: str, _cache_key: int) -> list:
     if not st.session_state.current_api_key: return [{"risk": "No API key", "severity": "medium", "mitigation": ""}]
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=st.session_state.current_api_key)
         prompt = f"""Analyze candidate pool for hiring risks. Return JSON array of {{risk, severity (high/medium/low), mitigation}}.
 Candidates: {_candidates_json[:10000]}"""
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-lite", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"))
-        r = json.loads(resp.text)
+        raw = gemini_generate_content(prompt, st.session_state.current_api_key, model="models/gemini-2.0-flash-lite")
+        r = json.loads(raw)
         return r[:7] if isinstance(r, list) else []
     except Exception as e:
         return [{"risk": str(e), "severity": "medium", "mitigation": "Manual review"}]
@@ -1302,17 +1298,12 @@ Candidates: {_candidates_json[:10000]}"""
 def _cached_actions(_candidates_json: str, _jd: str, _cache_key: int) -> list:
     if not st.session_state.current_api_key: return [{"action": "No API key", "priority": "high", "detail": ""}]
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=st.session_state.current_api_key)
         prompt = f"""Generate 3-5 actionable next steps for the recruiter based on this data.
 Return JSON array of {{action, priority (high/medium/low), detail}}.
 Job: {(_jd or "")[:1000]}
 Candidates: {_candidates_json[:10000]}"""
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-lite", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"))
-        r = json.loads(resp.text)
+        raw = gemini_generate_content(prompt, st.session_state.current_api_key, model="models/gemini-2.0-flash-lite")
+        r = json.loads(raw)
         return r[:5] if isinstance(r, list) else []
     except Exception as e:
         return [{"action": str(e), "priority": "medium", "detail": ""}]
@@ -1321,16 +1312,11 @@ Candidates: {_candidates_json[:10000]}"""
 def _cached_cutoff(_candidates_json: str, _cache_key: int) -> dict:
     if not st.session_state.current_api_key: return {"error": "No API key"}
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=st.session_state.current_api_key)
         prompt = f"""Analyze candidate pool and suggest interview cutoff score.
 Return JSON: suggested_cutoff (0-100), candidates_above (int), candidates_below (int), rationale, recommended_interview_slots (int).
 Candidates: {_candidates_json[:10000]}"""
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-lite", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"))
-        r = json.loads(resp.text)
+        raw = gemini_generate_content(prompt, st.session_state.current_api_key, model="models/gemini-2.0-flash-lite")
+        r = json.loads(raw)
         return {"suggested_cutoff": r.get("suggested_cutoff", 70),
                 "candidates_above": r.get("candidates_above", 0),
                 "candidates_below": r.get("candidates_below", 0),
@@ -1343,18 +1329,13 @@ Candidates: {_candidates_json[:10000]}"""
 def _cached_compare(_a_json: str, _b_json: str, _cache_key: int) -> dict:
     if not st.session_state.current_api_key: return {"error": "No API key"}
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=st.session_state.current_api_key)
         prompt = f"""Compare these two candidates side-by-side.
 Return JSON: recommendation (1-2 sentences), strengths_a (list), strengths_b (list),
 weaknesses_a (list), weaknesses_b (list), fit_score_a (0-100), fit_score_b (0-100).
 Candidate A: {_a_json[:5000]}
 Candidate B: {_b_json[:5000]}"""
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-lite", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"))
-        r = json.loads(resp.text)
+        raw = gemini_generate_content(prompt, st.session_state.current_api_key, model="models/gemini-2.0-flash-lite")
+        r = json.loads(raw)
         return {"recommendation": safe_get(r, "recommendation", ""),
                 "strengths_a": safe_list_get(r, "strengths_a", []),
                 "strengths_b": safe_list_get(r, "strengths_b", []),
@@ -1369,16 +1350,11 @@ Candidate B: {_b_json[:5000]}"""
 def _cached_top_reasons(_candidates_json: str, _cache_key: int) -> list:
     if not st.session_state.current_api_key: return []
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=st.session_state.current_api_key)
         prompt = f"""For each candidate provide one sentence explaining why they are a top candidate.
 Return JSON array of {{name, reason}}.
 Candidates: {_candidates_json[:8000]}"""
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash-lite", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"))
-        r = json.loads(resp.text)
+        raw = gemini_generate_content(prompt, st.session_state.current_api_key, model="models/gemini-2.0-flash-lite")
+        r = json.loads(raw)
         return r if isinstance(r, list) else []
     except Exception:
         return []
@@ -1914,7 +1890,7 @@ def render_evaluate():
     if total_w != 100:
         st.caption(f"Total: {total_w}% (will be normalized to 100%)")
 
-    if st.button("Run Evaluation", type="primary"):
+    if st.button("Run Evaluation", type="primary", key="run_evaluation"):
         resume_col = find_resume_column(df)
         github_col = find_github_column(df)
         name_col = find_name_column(df)
@@ -1922,53 +1898,71 @@ def render_evaluate():
         results = {}
         explanations = {}
         github_analysis = {}
+        errors = []
         total = len(df)
-        
         progress_bar = st.progress(0, text="Initializing evaluation sequence...")
-        
-        for idx, row in df.iterrows():
-            try:
+
+        with st.spinner("Running evaluation..."):
+            for idx, row in df.iterrows():
                 name = str(row.get(name_col, f"Candidate {idx + 1}"))
-                progress_bar.progress((idx) / total, text=f"Evaluating {name}...")
-                
-                resume_text = st.session_state.resume_texts.get(idx, "")
-                candidate_info = {col: str(row[col]) for col in df.columns if col != resume_col and pd.notna(row[col]) and str(row[col]).strip()}
-                
-                if use_demo:
-                    import random
-                    time.sleep(0.5)
-                    score = random.randint(40, 95)
+                try:
+                    progress_bar.progress((idx + 1) / total, text=f"Evaluating {name}...")
+                    resume_text = st.session_state.resume_texts.get(idx, "")
+                    candidate_info = {col: str(row[col]) for col in df.columns if col != resume_col and pd.notna(row[col]) and str(row[col]).strip()}
+
+                    if use_demo:
+                        import random
+                        time.sleep(0.5)
+                        score = random.randint(40, 95)
+                        results[int(idx)] = {
+                            "score": score,
+                            "recommendation": "Shortlist" if score > 80 else "Maybe" if score > 50 else "Reject",
+                            "strengths": ["Python", "System Design"] if score > 70 else ["Communication"],
+                            "weaknesses": ["Cloud Ops"] if score < 60 else ["None"],
+                            "summary": "Simulated demo evaluation output."
+                        }
+                    else:
+                        results[int(idx)] = evaluate_candidate_with_gemini(candidate_info, resume_text, jd.strip(), api_key)
+                        if generate_explanations:
+                            progress_bar.progress((idx + 1) / total, text=f"Generating AI explanation for {name}...")
+                            explanation = generate_ai_explanation_with_gemini(candidate_info, resume_text, jd.strip(), results[int(idx)], api_key)
+                            if explanation:
+                                explanations[int(idx)] = explanation
+                        if analyze_github:
+                            progress_bar.progress((idx + 1) / total, text=f"Analyzing GitHub profile for {name}...")
+                            if github_col and pd.notna(row.get(github_col)) and str(row.get(github_col)).strip():
+                                username = extract_github_username(str(row.get(github_col)).strip())
+                                github_analysis[int(idx)] = build_github_analysis(username, api_key) if username else {"ok": False, "message": "GitHub analysis unavailable."}
+                            else:
+                                github_analysis[int(idx)] = {"ok": False, "message": "No GitHub profile available.", "missing": True}
+                        time.sleep(4.2)
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
                     results[int(idx)] = {
-                        "score": score,
-                        "recommendation": "Shortlist" if score > 80 else "Maybe" if score > 50 else "Reject",
-                        "strengths": ["Python", "System Design"] if score > 70 else ["Communication"],
-                        "weaknesses": ["Cloud Ops"] if score < 60 else ["None"],
-                        "summary": "Simulated demo evaluation output."
+                        "score": 0,
+                        "recommendation": "Reject",
+                        "strengths": ["None"],
+                        "weaknesses": ["Evaluation error"],
+                        "summary": "Candidate evaluation failed due to an internal error."
                     }
-                else:
-                    results[int(idx)] = evaluate_candidate_with_gemini(candidate_info, resume_text, jd.strip(), api_key)
-                    if generate_explanations:
-                        progress_bar.progress((idx) / total, text=f"Generating AI explanation for {name}...")
-                        explanation = generate_ai_explanation_with_gemini(candidate_info, resume_text, jd.strip(), results[int(idx)], api_key)
-                        if explanation:
-                            explanations[int(idx)] = explanation
-                    if analyze_github:
-                        progress_bar.progress((idx) / total, text=f"Analyzing GitHub profile for {name}...")
-                        if github_col and pd.notna(row.get(github_col)) and str(row.get(github_col)).strip():
-                            username = extract_github_username(str(row.get(github_col)).strip())
-                            github_analysis[int(idx)] = build_github_analysis(username, api_key) if username else {"ok": False, "message": "GitHub analysis unavailable."}
-                        else:
-                            github_analysis[int(idx)] = {"ok": False, "message": "No GitHub profile available.", "missing": True}
-                    time.sleep(4.2)
-            except Exception:
-                continue
-                
-        progress_bar.progress(1.0, text="Evaluation complete.")
-        st.session_state.evaluation_results = results
-        st.session_state.ai_explanations = explanations
-        st.session_state.github_analysis = github_analysis
-        st.session_state.evaluated = True
-        set_page("Rankings")
+
+            progress_bar.progress(1.0, text="Evaluation complete.")
+
+            st.session_state.evaluation_results = results
+            st.session_state.ai_explanations = explanations
+            st.session_state.github_analysis = github_analysis
+            st.session_state.evaluated = bool(results)
+
+            if errors:
+                with st.expander("Evaluation Errors", expanded=True):
+                    for err in errors:
+                        st.error(err)
+
+            if results:
+                set_page("Rankings")
+                st.rerun()
+            else:
+                st.error("No candidates were successfully evaluated. Check your job description, API key, or candidate data.")
 
 
 def render_rankings():
